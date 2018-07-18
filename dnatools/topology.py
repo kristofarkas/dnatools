@@ -3,7 +3,12 @@ import tempfile
 import subprocess
 
 import numpy as np
+
+import parmed as pmd
+
 from openeye.oechem import *
+from openeye.oedepict import *
+from openeye.oeiupac import OECreateIUPACName
 
 
 class Intercalator:
@@ -15,7 +20,8 @@ class Intercalator:
     def __init__(self):
         super(Intercalator, self).__init__()
         self._mol = OEMol()
-        self._mcss = None
+        self._frcmod = None
+        self._mcss: OEMCSSearch = None
 
     @property
     def mol(self):
@@ -41,6 +47,8 @@ class Intercalator:
         if add_hydrogens:
             OEAddExplicitHydrogens(m)
 
+        m.SetTitle(OECreateIUPACName(m))
+
         # TODO: only assign TRIPOS names and types if we want to write this molecule as MOL2 and
         # there are no names and types already assign. Also we would probably want to make these
         # changes only on a copy of the molecule, not the molecule itself!
@@ -51,8 +59,9 @@ class Intercalator:
 
         return i
 
-    def prepare_for_mcs(self):
-        self._mcss = OEMCSSearch(self._mol, self.atom_expression, self.bond_expression, OEMCSType_Default)
+    def prepare_for_mcs(self, approximate=False):
+        self._mcss = OEMCSSearch(self._mol, self.atom_expression, self.bond_expression,
+                                 OEMCSType_Default if not approximate else OEMCSType_Approximate)
         self._mcss.SetMCSFunc(OEMCSMaxAtomsCompleteCycles())
         self._mcss.SetMinAtoms(6)
 
@@ -63,24 +72,29 @@ class Intercalator:
         return charge
 
     def assign_amber_atomtypes(self):
-        name = 'mol.mol2'
-        out_name = 'gaff.mol2'
         with tempfile.TemporaryDirectory() as tempdir:
-            self.write_mol2(os.path.join(tempdir, name))
+            name = os.path.join(tempdir, 'mol.mol2')
+            out_name = os.path.join(tempdir, 'gaff.mol2')
+
+            self.write_mol2(name)
             subprocess.run(['antechamber',
-                            '-i', os.path.join(tempdir, name), '-fi', 'mol2',
-                            '-o', os.path.join(tempdir, out_name), '-fo', 'mol2',
+                            '-i', name, '-fi', 'mol2',
+                            '-o', out_name, '-fo', 'mol2',
                             '-at', 'gaff2', '-du', 'n', '-an', 'n', '-j', '1', '-pf', 'y', '-dr', 'n'])
-            gaff = Intercalator.read_mol2(os.path.join(tempdir, out_name))
+            gaff = Intercalator.read_mol2(out_name)
             for a, b in zip(self._mol.GetAtoms(), gaff.GetAtoms()):
                 a.SetType(b.GetType())
 
     def generate_conformers(self, max_confs=800, rms_threshold=1.0):
+
+        self._mol.SetDimension(3)
+
         from openeye.oeomega import OEOmega
 
         om = OEOmega()
         om.SetMaxConfs(max_confs)
         om.SetIncludeInput(True)
+        om.SetStrictStereo(False)
         om.SetCanonOrder(False)
         om.SetSampleHydrogens(True)
         om.SetEnergyWindow(15.0)
@@ -88,10 +102,7 @@ class Intercalator:
 
         success = om(self._mol)
 
-        if success:
-            # We have 3D conformers now, needs to be set for other parts of the program to know this.
-            self._mol.SetDimension(3)
-        else:
+        if not success:
             print('Failed to generate multiple conformers from molecule.')
 
     def assign_am1bcc_charges(self):
@@ -100,6 +111,23 @@ class Intercalator:
         am1bcc = OEAM1BCCELF10Charges()
         am1bcc.SetReturnSelectedConfs(True)
         OEAssignCharges(self._mol, am1bcc)
+
+    @property
+    def force_field_modification(self):
+
+        if self._frcmod is not None:
+            return self._frcmod
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            name = os.path.join(tempdir, 'mol.mol2')
+            out_name = os.path.join(tempdir, 'mol.frcmod')
+
+            self.write_mol2(name)
+            subprocess.run(['parmchk2', '-i', name, '-f', 'mol2', '-o', out_name, '-s', '2'])
+
+            self._frcmod = pmd.load_file(out_name)
+
+        return self._frcmod
 
     def write_mol2(self, name):
         ofs = oemolostream(name)
@@ -136,7 +164,7 @@ class HybridTopology:
     def _align_molecules(self):
         overlay = True
         rotate, translate = OEDoubleArray(9), OEDoubleArray(3)
-        OERMSD(self.pattern.mol, self.target.mol, self._match, overlay, rotate, translate)
+        OERMSD(self.pattern.mcss.GetPattern(), self.target.mol, self._match, overlay, rotate, translate)
         OERotate(self.target.mol, rotate)
         OETranslate(self.target.mol, translate)
 
@@ -227,3 +255,49 @@ class HybridTopology:
                 pattern_charge += a.GetPartialCharge()
 
         self.hybrid.mol = hybrid
+
+    def draw_hybrid(self, name):
+
+        p, t =  self.pattern.mcss.GetPattern(), self.target.mol
+
+        OEPrepareDepiction(p, False, False)
+        OEPrepareDepiction(t, False, False)
+
+        image = OEImage(1000, 500)
+
+        rows, cols = 1, 2
+        grid = OEImageGrid(image, rows, cols)
+
+        opts = OE2DMolDisplayOptions(grid.GetCellWidth(), grid.GetCellHeight(), OEScale_AutoScale)
+        opts.SetTitleLocation(OETitleLocation_Hidden)
+
+        refscale = OEGetMoleculeScale(p, opts)
+        fitscale = OEGetMoleculeScale(t, opts)
+        opts.SetScale(min(refscale, fitscale))
+        opts.SetHydrogenStyle(OEHydrogenStyle_ExplicitAll)
+
+        refdisp = OE2DMolDisplay(p, opts)
+        fitdisp = OE2DMolDisplay(t, opts)
+
+        refabset = oechem.OEAtomBondSet(self._match.GetPatternAtoms(), self._match.GetPatternBonds())
+        OEAddHighlighting(refdisp, oechem.OEBlueTint, OEHighlightStyle_BallAndStick, refabset)
+
+        fitabset = oechem.OEAtomBondSet(self._match.GetTargetAtoms(), self._match.GetTargetBonds())
+        OEAddHighlighting(fitdisp, oechem.OEBlueTint, OEHighlightStyle_BallAndStick, fitabset)
+
+        refcell = grid.GetCell(1, 1)
+        OERenderMolecule(refcell, refdisp)
+
+        fitcell = grid.GetCell(1, 2)
+        OERenderMolecule(fitcell, fitdisp)
+
+        OEWriteImage(name, image)
+
+    @property
+    def charge_correction(self):
+        diff = 0
+
+        for m in self._match.GetAtoms():
+            diff += (m.pattern.GetPartialCharge() - m.target.GetPartialCharge()) / 2
+
+        return diff
