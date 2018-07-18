@@ -8,6 +8,7 @@ import parmed as pmd
 
 from openeye.oechem import *
 from openeye.oedepict import *
+from openeye.oedocking import *
 from openeye.oeiupac import OECreateIUPACName
 
 
@@ -17,10 +18,9 @@ class Intercalator:
                       OEExprOpts_RingMember | OEExprOpts_StringType
     bond_expression = OEExprOpts_Aromaticity | OEExprOpts_BondOrder | OEExprOpts_RingMember
 
-    def __init__(self):
-        super(Intercalator, self).__init__()
-        self._mol = OEMol()
-        self._frcmod = None
+    def __init__(self, mol=None):
+        self._mol: OEMCMolBase = mol or OEMol()
+        self._frcmod: pmd.amber.AmberParameterSet = None
         self._mcss: OEMCSSearch = None
 
     @property
@@ -113,7 +113,7 @@ class Intercalator:
         OEAssignCharges(self._mol, am1bcc)
 
     @property
-    def force_field_modification(self):
+    def frcmod(self):
 
         if self._frcmod is not None:
             return self._frcmod
@@ -143,17 +143,15 @@ class Intercalator:
         return mol
 
 
-class HybridTopology:
+class HybridIntercalator(Intercalator):
 
     def __init__(self, pattern: Intercalator, target: Intercalator, threshold=0.01):
-        super(HybridTopology, self).__init__()
+        super(HybridIntercalator, self).__init__()
         self.target = target
         self.threshold = threshold
 
         self.pattern = pattern
         self.pattern.prepare_for_mcs()
-
-        self.hybrid = Intercalator()
 
         matches = self.pattern.mcss.Match(self.target.mol, True)
         self._match = matches.next()
@@ -254,11 +252,11 @@ class HybridTopology:
             if a in hybrid_atom_map:
                 pattern_charge += a.GetPartialCharge()
 
-        self.hybrid.mol = hybrid
+        self._mol = hybrid
 
     def draw_hybrid(self, name):
 
-        p, t =  self.pattern.mcss.GetPattern(), self.target.mol
+        p, t = self.pattern.mcss.GetPattern(), self.target.mol
 
         OEPrepareDepiction(p, False, False)
         OEPrepareDepiction(t, False, False)
@@ -301,3 +299,48 @@ class HybridTopology:
             diff += (m.pattern.GetPartialCharge() - m.target.GetPartialCharge()) / 2
 
         return diff
+
+
+class DNA:
+    def __init__(self, dna: OEMolBase, box: OEBox):
+        self._receptor: OEMolBase = OEGraphMol()
+        OEMakeReceptor(self._receptor, dna, box)
+
+        self._dock: OEDock = OEDock(OEDockMethod_Chemgauss4, OESearchResolution_High)
+        self._dock.Initialize(self._receptor)
+
+    @classmethod
+    def with_intercalators(cls, dna: OEMolBase, original_intercalator: Intercalator, *intercalators: Intercalator,
+                           padding: float=2.0):
+        """Convenience initializer for multiple intercalators and when there was an original intercalator
+        inside the crystal structure.
+
+        :param dna: The DNA structure only.
+        :param original_intercalator: The original intercalator that was in the crystal structure.
+        :param intercalators: The list of intercalator you will want to dock
+        :param padding: padding to add to the box created around the original intercalator
+        :return: a DNA instance correctly initialized for docking
+        """
+        # This is the box of the original intercalator. We want to dock somewhere around here.
+        box = OEBox(original_intercalator.mol)
+
+        max_side = max(d for xyz in [cls.get_box_dims(OEBox(mol.mol)) for mol in intercalators + [original_intercalator]] for d in xyz)
+
+        extend = [(max_side-c)/2 + padding for c in cls.get_box_dims(box)]
+
+        OEBoxExtend(box, *extend)
+
+        return cls(dna, box)
+
+    @staticmethod
+    def get_box_dims(box):
+        return OEBoxXDim(box), OEBoxZDim(box), OEBoxZDim(box)
+
+    def dock_intercalator(self, mol: OEGraphMol):
+        docked_mol = OEGraphMol()
+        self._dock.DockMultiConformerMolecule(docked_mol, mol)
+        sd_tag = OEDockMethodGetName(OEDockMethod_Chemgauss4)
+        OESetSDScore(docked_mol, self._dock, sd_tag)
+        self._dock.AnnotatePose(docked_mol)
+
+        return Intercalator(docked_mol)
