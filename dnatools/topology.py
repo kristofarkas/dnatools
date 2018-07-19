@@ -85,7 +85,7 @@ class Intercalator:
             subprocess.run(['antechamber',
                             '-i', name, '-fi', 'mol2',
                             '-o', out_name, '-fo', 'mol2',
-                            '-at', 'gaff2', '-du', 'n', '-an', 'n', '-j', '1', '-pf', 'y', '-dr', 'n'])
+                            '-at', 'gaff2', '-du', 'n', '-an', 'n', '-j', '1', '-pf', 'y'])
             gaff = Intercalator.read_mol2(out_name)
             for a, b in zip(self._mol.GetAtoms(), gaff.GetAtoms()):
                 a.SetType(b.GetType())
@@ -130,7 +130,7 @@ class Intercalator:
             self.write_mol2(name)
             subprocess.run(['parmchk2', '-i', name, '-f', 'mol2', '-o', out_name, '-s', '2'])
 
-            self._frcmod = pmd.load_file(out_name)
+            self._frcmod: pmd.amber.AmberParameterSet = pmd.load_file(out_name)
 
         return self._frcmod
 
@@ -157,6 +157,8 @@ class HybridIntercalator(Intercalator):
 
         self.pattern = pattern
         self.pattern.prepare_for_mcs()
+
+        self.alchemical_tag = list()
 
         matches = self.pattern.mcss.Match(self.target.mol, True)
         self._match = matches.next()
@@ -238,13 +240,21 @@ class HybridIntercalator(Intercalator):
             charge_adjustment += (p.pattern.GetPartialCharge() - p.target.GetPartialCharge()) / 2
             hybrid_atom_map[p.pattern.GetIdx()].SetPartialCharge(new_charge)
 
+        alchemical_tag = list()
+
         for hybrid_atom in hybrid.GetAtoms():
             if hybrid_atom in atom_map.values():
+                alchemical_tag.append(1.0)
                 hybrid_atom.SetPartialCharge(hybrid_atom.GetPartialCharge() - charge_adjustment / len(atom_map))
-            if (hybrid_atom in hybrid_atom_map) and not (
+            elif (hybrid_atom in hybrid_atom_map) and not (
                     hybrid_atom in [hybrid_atom_map[a.GetIdx()] for a in self._match.GetPatternAtoms()]):
+                alchemical_tag.append(-1.0)
                 hybrid_atom.SetPartialCharge(hybrid_atom.GetPartialCharge() + charge_adjustment / (
                             self.pattern.mol.NumAtoms() - len([_ for _ in self._match.GetPatternAtoms()])))
+            else:
+                alchemical_tag.append(0.0)
+
+        self.alchemical_tag = alchemical_tag
 
         # Check charges
 
@@ -256,6 +266,8 @@ class HybridIntercalator(Intercalator):
                 target_charge += a.GetPartialCharge()
             if a in hybrid_atom_map:
                 pattern_charge += a.GetPartialCharge()
+
+        print("Charges on target and pattern:", target_charge, pattern_charge)
 
         self._mol = hybrid
 
@@ -308,11 +320,16 @@ class HybridIntercalator(Intercalator):
 
 class DNA:
     def __init__(self, dna: OEMolBase, box: OEBox):
+        self._dna: OEMolBase = dna
         self._receptor: OEMolBase = OEGraphMol()
         OEMakeReceptor(self._receptor, dna, box)
 
         self._dock: OEDock = OEDock(OEDockMethod_Chemgauss4, OESearchResolution_High)
         self._dock.Initialize(self._receptor)
+
+    @property
+    def dna(self):
+        return self._dna
 
     @classmethod
     def with_original_intercalator(cls, dna: OEMolBase, original_intercalator: Intercalator, padding: float=2.0):
@@ -328,7 +345,7 @@ class DNA:
         return cls(dna, box)
 
     @classmethod
-    def with_intercalators(cls, dna: OEMolBase, original_intercalator: Intercalator, *intercalators: Intercalator,
+    def with_intercalators(cls, dna: OEMolBase, original_intercalator: Intercalator, intercalators: [Intercalator],
                            padding: float=2.0):
         """Convenience initializer for multiple intercalators and when there was an original intercalator
         inside the crystal structure.
@@ -342,7 +359,7 @@ class DNA:
         # This is the box of the original intercalator. We want to dock somewhere around here.
         box = OEBox(original_intercalator.mol)
 
-        max_side = max(d for xyz in [cls.get_box_dims(OEBox(mol.mol)) for mol in intercalators + [original_intercalator]] for d in xyz)
+        max_side = max(d for xyz in [cls.get_box_dims(OEBox(mol.mol)) for mol in (intercalators + [original_intercalator])] for d in xyz)
 
         extend = [(max_side-c)/2 + padding for c in cls.get_box_dims(box)]
 
