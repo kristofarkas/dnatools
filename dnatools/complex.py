@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 import parmed as pmd
 from yank.utils import TLeap, write_oe_molecule
@@ -57,5 +58,6 @@ class Complex:
             tags = os.path.join(self.sim_dir, "tags.pdb")
 
             dn.write_pdb(tags, renumber=False, increase_tercount=False)
+            subprocess.run(["sed", "-i.bak",  "'s/HETATM/ATOM  /g'", tags])
 
         return pdb, prmtop
