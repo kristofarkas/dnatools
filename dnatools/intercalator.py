@@ -11,8 +11,6 @@ from openeye.oedepict import *
 from openeye.oedocking import *
 from openeye.oeiupac import OECreateIUPACName
 
-# from yank.utils import TLeap
-
 
 class Intercalator:
 
@@ -77,6 +75,10 @@ class Intercalator:
         return charge
 
     def assign_amber_atomtypes(self):
+        """
+        Change every atom type in the molecule to GAFF2 Amber atom types. Once set
+        this cannot be backtracked.
+        """
         with tempfile.TemporaryDirectory() as tempdir:
             name = os.path.join(tempdir, 'mol.mol2')
             out_name = os.path.join(tempdir, 'gaff.mol2')
@@ -90,8 +92,10 @@ class Intercalator:
             for a, b in zip(self._mol.GetAtoms(), gaff.GetAtoms()):
                 a.SetType(b.GetType())
 
-    def generate_conformers(self, max_confs=800, rms_threshold=1.0):
+    def generate_conformers(self, max_confs=1000, rms_threshold=1.0):
 
+        # If generated from a SMILES string, molecule dimension will be 2.
+        # `OEOmega` requires 3D coordinates, so we are setting this here.
         self._mol.SetDimension(3)
 
         from openeye.oeomega import OEOmega
@@ -317,123 +321,3 @@ class HybridIntercalator(Intercalator):
 
         return diff
 
-
-class DNA:
-    def __init__(self, dna: OEMolBase, box: OEBox):
-        self._dna: OEMolBase = dna
-        self._receptor: OEMolBase = OEGraphMol()
-        OEMakeReceptor(self._receptor, dna, box)
-
-        self._dock: OEDock = OEDock(OEDockMethod_Chemgauss4, OESearchResolution_High)
-        self._dock.Initialize(self._receptor)
-
-    @property
-    def dna(self):
-        return self._dna
-
-    @classmethod
-    def with_original_intercalator(cls, dna: OEMolBase, original_intercalator: Intercalator, padding: float=2.0):
-
-        box = OEBox(original_intercalator.mol)
-
-        max_side = max(cls.get_box_dims(box))
-
-        extend = [(max_side-c)/2 + padding for c in cls.get_box_dims(box)]
-
-        OEBoxExtend(box, *extend)
-
-        return cls(dna, box)
-
-    @classmethod
-    def with_intercalators(cls, dna: OEMolBase, original_intercalator: Intercalator, intercalators: [Intercalator],
-                           padding: float=2.0):
-        """Convenience initializer for multiple intercalators and when there was an original intercalator
-        inside the crystal structure.
-
-        :param dna: The DNA structure only.
-        :param original_intercalator: The original intercalator that was in the crystal structure.
-        :param intercalators: The list of intercalator you will want to dock
-        :param padding: padding to add to the box created around the original intercalator
-        :return: a DNA instance correctly initialized for docking
-        """
-        # This is the box of the original intercalator. We want to dock somewhere around here.
-        box = OEBox(original_intercalator.mol)
-
-        max_side = max(d for xyz in [cls.get_box_dims(OEBox(mol.mol)) for mol in (intercalators + [original_intercalator])] for d in xyz)
-
-        extend = [(max_side-c)/2 + padding for c in cls.get_box_dims(box)]
-
-        OEBoxExtend(box, *extend)
-
-        return cls(dna, box)
-
-    @staticmethod
-    def get_box_dims(box):
-        return OEBoxXDim(box), OEBoxYDim(box), OEBoxZDim(box)
-
-    def dock_intercalator(self, intercalator: Intercalator):
-        """
-        Dock molecule into DNA base-pair sequence.
-        :param intercalator: molecule to be docked
-        :return: docked molecule, rmsd
-            Note, rmsd might only be relevant if the original molecule was, let's say, at a crystal structure
-            docked site. Otherwise the rmsd from some arbitrary position is irrelevant.
-        """
-        docked_mol = OEGraphMol()
-        self._dock.DockMultiConformerMolecule(docked_mol, intercalator.mol)
-        sd_tag = OEDockMethodGetName(OEDockMethod_Chemgauss4)
-        OESetSDScore(docked_mol, self._dock, sd_tag)
-        self._dock.AnnotatePose(docked_mol)
-
-        return Intercalator(docked_mol), OERMSD(intercalator.mol, docked_mol)
-
-
-def load_oe_molecules(file_path, molecule_idx=None):
-    """Read one or more molecules from a file.
-    Requires OpenEye Toolkit. Several formats are supported (including
-    mol2, sdf and pdb).
-    Parameters
-    ----------
-    file_path : str
-        Complete path to the file on disk.
-    molecule_idx : None or int, optional, default: None
-        Index of the molecule on the file. If None, all of them are
-        returned.
-    Returns
-    -------
-    molecule : openeye.oechem.OEMol or list of openeye.oechem.OEMol
-        The molecules stored in the file. If molecule_idx is specified
-        only one molecule is returned, otherwise a list (even if the
-        file contain only 1 molecule).
-    """
-
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    from openeye import oechem
-    extension = os.path.splitext(file_path)[1][1:]  # Remove dot.
-
-    # Open input file stream
-    ifs = oechem.oemolistream()
-    if extension == 'mol2':
-        mol2_flavor = (oechem.OEIFlavor_Generic_Default |
-                       oechem.OEIFlavor_MOL2_Default |
-                       oechem.OEIFlavor_MOL2_Forcefield)
-        ifs.SetFlavor(oechem.OEFormat_MOL2, mol2_flavor)
-    if not ifs.open(file_path):
-        oechem.OEThrow.Fatal('Unable to open {}'.format(file_path))
-
-    # Read all molecules.
-    molecules = []
-    for mol in ifs.GetOEMols():
-        molecules.append(oechem.OEMol(mol))
-
-    # Select conformation of interest
-    if molecule_idx is not None:
-        return molecules[molecule_idx]
-
-    return molecules
-
-
-def load_oe_molecule(file_path):
-    return load_oe_molecules(file_path, molecule_idx=0)
