@@ -80,7 +80,7 @@ class Complex:
         if isinstance(self.intercalator, HybridIntercalator):
 
             pdbs = {"intercalator_tags.pdb": intercalator_pdb,
-                    "tags.pdb": pdb}
+                    "complex_tags.pdb": pdb}
 
             for name, pdb in pdbs.items():
                 dn: pmd.structure.Structure = pmd.load_file(pdb)
